@@ -8,9 +8,10 @@ type LispVal =
     | DottedList of LispVal list * LispVal
     | String of string
     | Bool of bool
-    | Func of (LispVal list -> LispVal)
+    | Func of string list * LispVal list * Env
+    | PrimitiveFunc of (LispVal list -> LispVal)
 
-type Env = Dictionary<string, LispVal>
+and Env = Dictionary<string, LispVal>
 
 let globalEnv: Env = Dictionary<string, LispVal>()
 
@@ -47,8 +48,9 @@ let rec eval expr (env: Env) =
         | true, value -> value
         | false, _ -> failwithf "Unknown symbol: %s" s
     | Number n -> Number n
+    | String s -> String s
     | Bool b -> Bool b
-    | List (Symbol "quote" :: xs) -> List xs
+    | List [Symbol "quote"; xs] -> xs
     | List (Symbol "if" :: test :: conseq :: alt :: []) ->
         match eval test env with
         | Bool true -> eval conseq env
@@ -60,13 +62,11 @@ let rec eval expr (env: Env) =
         Symbol name
     | List (Symbol "lambda" :: List prms :: body) ->
         let paramNames = List.map (function Symbol name -> name | _ -> failwith "Invalid parameter") prms
-        Func (fun args ->
-            let localEnv: Env = Dictionary<string, LispVal>(env)
-            List.iter2 (fun param arg -> localEnv.[param] <- arg) paramNames args
-            evalBody localEnv body) 
+        Func (paramNames, body, env)
     | List (funcExpr :: args) ->
         let funcVal = eval funcExpr env
-        apply funcVal (List.map (fun arg -> eval arg env) args)
+        let argVals = args |> List.map (fun arg -> eval arg env)
+        apply funcVal argVals
     | _ -> expr
 
 and evalBody env body =
@@ -77,23 +77,29 @@ and evalBody env body =
 
 and apply func args =
     match func with
-    | Func f -> f args
+    | PrimitiveFunc f -> f args
+    | Func (prms, body, closureEnv) ->
+        if List.length prms <> List.length args then
+            failwithf "Incorrect number of arguments: expected %d, got %d" (List.length prms) (List.length args)
+        else
+            let localEnv = Dictionary<string, LispVal>(closureEnv)
+            List.iter2 (fun param arg -> localEnv.[param] <- arg) prms args
+            evalBody localEnv body
     | _ -> failwithf "Unknown function: %A" func
 
-and defineFunction name func (env: Env) =
-    env.[name] <- func 
+and defineFunction name value (env: Env) =
+    env.[name] <- value
     printfn "Defined function %s" name
 
-// Define built-in functions with support for multiple arguments
 let builtInFunctions = [
-    "+", Func (fun args ->
+    "+", PrimitiveFunc (fun args ->
         let rec sum acc lst =
             match lst with
             | [] -> Number acc
             | Number n :: rest -> sum (acc + n) rest
             | _ -> failwith "Invalid arguments for +"
         sum 0 args)
-    "-", Func (fun args ->
+    "-", PrimitiveFunc (fun args ->
         match args with
         | [] -> failwith "Invalid arguments for -"
         | [Number a] -> Number (-a)
@@ -105,14 +111,14 @@ let builtInFunctions = [
                 | _ -> failwith "Invalid arguments for -"
             subtract a rest
         | _ -> failwith "Invalid arguments for -")
-    "*", Func (fun args ->
+    "*", PrimitiveFunc (fun args ->
         let rec prod acc lst =
             match lst with
             | [] -> Number acc
             | Number n :: rest -> prod (acc * n) rest
             | _ -> failwith "Invalid arguments for *"
         prod 1 args)
-    "/", Func (fun args ->
+    "/", PrimitiveFunc (fun args ->
         match args with
         | [] -> failwith "Invalid arguments for /"
         | [Number a] -> Number (1 / a)
@@ -125,9 +131,59 @@ let builtInFunctions = [
                 | _ -> failwith "Invalid arguments for /"
             divide a rest
         | _ -> failwith "Invalid arguments for /")
+    "=", PrimitiveFunc (fun args ->
+        match args with
+        | [Number a; Number b] -> Bool (a = b)
+        | _ -> failwith "Invalid arguments for =")
+    "cons", PrimitiveFunc (fun args ->
+        match args with
+        | [x; List lst] -> List (x :: lst)
+        | [x; y] -> DottedList ([x], y)
+        | _ -> failwith "Invalid arguments for cons")
+    "car", PrimitiveFunc (fun args ->
+        match args with
+        | [List (x :: _)] -> x
+        | [DottedList (x :: _, _)] -> x
+        | _ -> failwith "Invalid arguments for car")
+    "cdr", PrimitiveFunc (fun args ->
+        match args with
+        | [List (_ :: xs)] -> List xs
+        | [DottedList ([_], tail)] -> tail
+        | [DottedList (_ :: xs, tail)] -> DottedList (xs, tail)
+        | _ -> failwith "Invalid arguments for cdr")
+    "list", PrimitiveFunc (fun args -> List args)
+    "length", PrimitiveFunc (fun args ->
+        match args with
+        | [List lst] -> Number (List.length lst)
+        | _ -> failwith "Invalid arguments for length")
+    "append", PrimitiveFunc (fun args ->
+        match args with
+        | [List lst1; List lst2] -> List (lst1 @ lst2)
+        | _ -> failwith "Invalid arguments for append")
+    "map", PrimitiveFunc (fun args ->
+        match args with
+        | [func; List lst] ->
+            let results = lst |> List.map (fun x -> apply func [x])
+            List results
+        | _ -> failwith "Invalid arguments for map")
+    "filter", PrimitiveFunc (fun args ->
+        match args with
+        | [func; List lst] ->
+            let results = lst |> List.filter (fun x ->
+                match apply func [x] with
+                | Bool true -> true
+                | Bool false -> false
+                | _ -> failwith "Filter function must return a boolean")
+            List results
+        | _ -> failwith "Invalid arguments for filter")
+    "reduce", PrimitiveFunc (fun args ->
+        match args with
+        | [func; initial; List lst] ->
+            let result = lst |> List.fold (fun acc x -> apply func [acc; x]) initial
+            result
+        | _ -> failwith "Invalid arguments for reduce")
 ]
 
-// Add built-in functions to the global environment
 for (name, func) in builtInFunctions do
     globalEnv.[name] <- func
 
@@ -145,7 +201,7 @@ let rec repl () =
         repl ()
 
 [<EntryPoint>]
-let main argv = 
+let main argv =
     printfn "Welcome to My Lisp Interpreter!"
     repl ()
     0
